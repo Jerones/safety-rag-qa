@@ -1,6 +1,8 @@
 package com.example.safetyrag;
 
 import com.example.safetyrag.config.AppProperties;
+import com.example.safetyrag.config.HostsFileGuard;
+import org.apache.commons.logging.LogFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -24,6 +26,22 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 public class SafetyRagApplication {
 
     public static void main(String[] args) {
+        // 必须在 Spring 启动前做：jdk.net.hosts.file 指向已删除的文件时，JDK 会让
+        // 所有域名解析直接失败（不回退系统 DNS），表现为"模型调用全挂、回答降级成
+        // 抽取式"，极易误判成网络故障。详见 HostsFileGuard 的类注释。
+        String hostsWarning = HostsFileGuard.clearIfUnusable();
+        if (hostsWarning != null) {
+            // 此时日志系统还没初始化，只能直接写 stderr。优先用纯 ASCII 输出，
+            // 避免在 GBK 终端里出现乱码（IDEA 因带 -Dfile.encoding=UTF-8 才显示正常）。
+            System.err.println("[WARN] jdk.net.hosts.file points to an unusable hosts file "
+                    + "and has been ignored; falling back to system DNS. "
+                    + "Remove -Djdk.net.hosts.file from your run configuration.");
+        }
         SpringApplication.run(SafetyRagApplication.class, args);
+        if (hostsWarning != null) {
+            // 日志系统已就绪，再打一条带完整中文原因的 WARN，便于在日志文件里追溯
+            LogFactory.getLog(SafetyRagApplication.class)
+                    .warn("[HostsFileGuard] " + hostsWarning);
+        }
     }
 }

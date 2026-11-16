@@ -165,6 +165,7 @@ Chroma 不在本机时：`export CHROMA_HOST=http://<ip>`。没有 key 想看效
 | `service/DocumentRegistry.java` | 文档注册表（`data/registry.json`）：补齐 VectorStore 抽象没有的"文档级管理"能力 |
 | `config/DemoModeConfig.java` | 演示模式：本地兜底 EmbeddingModel（字符 n-gram 哈希向量），无 key 可跑 |
 | `config/VectorStoreConfig.java` | **Chroma 装配**：自己建 tenant/database/collection，绕开 Spring AI"精确匹配错误文案"的集合判断 |
+| `config/HostsFileGuard.java` | **启动守卫**：`-Djdk.net.hosts.file` 指向不可用文件时自动清除并回退系统 DNS（JDK 在该设置失效时不会 fallback，会让所有外部请求直接失败，见"hosts 绕行也可能反噬"） |
 | `config/CachingEmbeddingModel.java` | **Embedding 批量预取装饰器**：把逐块调用合并成 5 条/请求，失败自动拆小重试（见下节） |
 | `config/HttpClientConfig.java` | 把流式用的 WebClient 换成 JDK HttpClient 传输层，与非流式保持一致（见"卡住 19 秒"一节） |
 | `tools/pin_dashscope_ip.py` | 逐个探测百炼的 A 记录，挑出"上行大包能通"的 IP 写入 `hosts`，绕开 PMTU 黑洞 |
@@ -343,6 +344,26 @@ SSE 流式事件序列：`rewrite`（多轮改写结果）→ 一串 `token`（�
 > `-Djdk.net.hosts.file` 参数（或删掉 `hosts` 文件）再试。结论：**换网络后优先验证是否还需要
 > hosts 绕行，不需要就直接删，别让一个过期的绕行方案反过来拖垮链路。**
 
+> **⚠️⚠️ 更隐蔽的一种：文件删了，参数还在。** `-Djdk.net.hosts.file` 指向的文件不存在时，
+> JDK **不会回退到系统 DNS**，而是对任何域名直接抛 `UnknownHostException`。实测（JDK 21）：
+> 不带参数 `resolve = 4 addrs / HTTP 401 / 375ms`；带参数但文件已删 → `resolve FAILED:
+> Unable to resolve host ... as hosts file ... not found`，请求 45ms 就失败。
+>
+> 由于 `hosts` 是临时产物、删了很自然，但启动参数容易残留在 **IDEA 运行配置的 VM options**、
+> 命令行历史或旧脚本里，于是症状变成"**一个根因、三个面具**"：
+>
+> | 表面症状 | 实际原因 |
+> |---|---|
+> | 回答降级成【抽取式】 | 生成模型调用在 DNS 解析阶段就失败 |
+> | 引用分数全是 `0.004` 量级 | 查询向量化同样失败 → 向量路降级，只剩 BM25（`0.25/(60+名次)`） |
+> | 索引统计里 `vectorDimension: 0` | 探测维度要发一次极小 embedding 请求，同样失败 |
+>
+> 看起来像网络故障、像向量库坏了，实际只是 DNS 解析被一个失效参数掐死了。
+> 本项目已加启动守卫 `config/HostsFileGuard`：发现该属性指向的文件不存在/不可读/只有注释时，
+> 自动清除属性并回退系统 DNS，同时打一条 `[HostsFileGuard]` 的 WARN 说明原因。
+> **即便如此，也请顺手把 IDEA 运行配置里残留的 `-Djdk.net.hosts.file=...` 删掉**，
+> 否则每次启动都会多一条警告。
+
 ## 写操作互斥与失败处理
 
 这三件事都会同时改"注册表 + 向量库"，所以必须串起来做：
@@ -424,6 +445,10 @@ SSE 流式事件序列：`rewrite`（多轮改写结果）→ 一串 `token`（�
    - 或在 IDEA 运行配置的 Environment variables 里填：
      `LLM_API_KEY=你的key;APP_DEMO_MODE=false`（可另加 `LLM_BASE_URL`、`LLM_CHAT_MODEL`、`LLM_EMBEDDING_MODEL` 覆盖端点与模型名）。
 4. **运行**：打开 `SafetyRagApplication`，点 main 方法旁的运行按钮。
+   > 若你之前为了绕开网络问题配过 `-Djdk.net.hosts.file=...`，**请到 Run → Edit Configurations
+   > → VM options 里把它删掉**。文件被删掉而参数还在时，JDK 会让所有域名解析直接失败，
+   > 表现为"回答永远是抽取式、向量维度显示 0"（详见上文"hosts 绕行也可能反噬"）。
+   > 代码里已有 `HostsFileGuard` 兜底，但清掉参数才是干净做法。
    命令行等价写法：`mvn spring-boot:run`（后端在本机跑时记得加 `--server.port=8080` 之类的显式端口）。
 5. **访问**：浏览器打开 http://localhost:8080 ，左侧切换「对话 / 知识库」两个菜单。
    首次启动会自动把 `sample_docs/` 里的示例规范入库，直接就能提问。
@@ -667,12 +692,19 @@ mvn test
 `ClauseLabelsTest`（编号压紧/三类条款号/表格数字拒绝/回溯）、`Bm25IndexTest`（关键词排序/删除/分词）、
 `HybridRetrieverTest`（8 条检索决策矩阵：无召回不答、BM25 不得单独引入新块、向量路有召回时允许 BM25 补块、
 关闭该开关后只重排、演示模式/向量库故障时放开）、
-`DocNamesTest`（磁盘文件名前缀清洗）、`DocumentRegistryTest`（落盘重载/前缀还原/损坏留档/批量销记）
+`DocNamesTest`（磁盘文件名前缀清洗）、`DocumentRegistryTest`（落盘重载/前缀还原/损坏留档/批量销记）、
+`HostsFileGuardTest`（5 条：未设置不处理、文件不存在清除、空 hosts 等于无效、合法文件保留、非法路径不抛异常）
 与 `ApiErrorMappingTest`（接口层 5 条：空问题 400、未知任务 404、缺上传字段 400、类型不支持 400、写冲突 409），
-共 **40 个用例**。除最后一个用 `@WebMvcTest` 只加载 Web 层（3 秒，不连库、不调模型）外，其余都是纯单元测试。
+共 **45 个用例**。除最后一个用 `@WebMvcTest` 只加载 Web 层（3 秒，不连库、不调模型）外，其余都是纯单元测试。
 
 ## 常见问题
 
+- **回答永远是【抽取式】，同时索引统计里 `vectorDimension` 显示 0、引用分数都是 `0.004` 量级**：
+  八成是启动参数里残留了 `-Djdk.net.hosts.file=...`，而指向的 `hosts` 文件已经删了。
+  JDK 在这种情况下**不会回退系统 DNS**，而是对任何域名直接抛 `UnknownHostException`，
+  于是模型调用、查询向量化、维度探测全部失败。三个症状其实是一个根因。
+  确认办法：启动日志里搜 `HostsFileGuard`，或临时 `curl` 直连百炼看是否 401 秒回（通就说明网络没问题）。
+  处理：删掉 IDEA 运行配置 VM options 里那个参数（新版本代码已会自动清除并打 WARN，但建议手工清理干净）。
 - **上传文档 / 重建索引 时报"入库失败"，且 Chroma 进程不见了**：
   说明 Chroma 服务端自己崩了（exit 139 段错误），不是应用逻辑问题。已知触发点：删除不存在的 id、
   索引扩容时 HNSW 重建——这两点在 **Windows 原生 pip 版**上必现（见上文实测表），Docker/Linux 版没有。
