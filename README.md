@@ -1,5 +1,10 @@
 # 基于 RAG 的施工安全规范智能问答系统
 
+> **分支说明**：本分支（`main`）的向量库实现是 **Chroma 0.5.23**。
+> 另有一条 [`qdrant`](https://github.com/Jerones/-ROG-/tree/qdrant) 分支，是同一套功能基于
+> **Qdrant 1.13.6** 的实现——业务代码、REST 接口、前端与评测集完全一致，
+> 差异只在向量库装配、按文档删除和连接重试的异常类型，两版共用同一套 45 个单元测试。
+
 <div align="center">
 
 ![JDK](https://img.shields.io/badge/JDK-21-007396?logo=openjdk&logoColor=white)
