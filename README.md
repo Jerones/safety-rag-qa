@@ -28,6 +28,9 @@
 |---|---|
 | ![对话页](docs/screenshots/chat.png) | ![知识库页](docs/screenshots/knowledge-base.png) |
 
+<sub>截图为 Chroma 分支实拍。两分支界面完全一致，仅左下角实现标识与检索工具栏的
+`vectorStore` 名不同（`ChromaVectorStore` / `QdrantVectorStore`）。</sub>
+
 </div>
 
 ## 目录
