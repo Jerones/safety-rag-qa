@@ -1,20 +1,22 @@
 # 基于 RAG 的施工安全规范智能问答系统
 
+> **分支说明**：`main` 分支的向量库实现是 **Chroma 0.5.23**；本分支（`qdrant`）是同一套功能的
+> **Qdrant 1.13.6** 版本。业务代码、REST 接口、前端页面、评测集完全一致，差异只集中在三处：
+> 向量库装配（`VectorStoreConfig`）、按文档删除的实现、以及连接重试的异常类型判定。
+> 两版共用同一套 45 个单元测试，切换分支即可对比同一功能在两种向量库上的落地方式。
+
 <div align="center">
 
 ![JDK](https://img.shields.io/badge/JDK-21-007396?logo=openjdk&logoColor=white)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4.5-6DB33F?logo=springboot&logoColor=white)
 ![Spring AI](https://img.shields.io/badge/Spring%20AI-1.0.0-6DB33F?logo=spring&logoColor=white)
-![Chroma](https://img.shields.io/badge/Chroma-0.5.23-0D0D0D?logo=chroma&logoColor=white)
+![Qdrant](https://img.shields.io/badge/Qdrant-1.13.6-FF4F8B)
 ![Maven](https://img.shields.io/badge/Maven-3.9.12-C71A36?logo=apachemaven&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-4C9F38?logo=opensourceinitiative&logoColor=white)
 
 **本地知识库 · 引用可溯源 · 无召回不编造**
 
 </div>
-
-> **公开发布版**：仓库中不含真实 API Key、本机 hosts、上传的规范原文与向量库数据。
-> 克隆后请先按 [SECURITY.md](SECURITY.md) 配置 `LLM_API_KEY`，并起一个 Chroma（`docker compose up -d`）再运行。
 
 面向施工现场安全管理场景的本地知识库问答：把施工安全规范（国家标准、行业标准）切分入库，
 提问时先检索相关条款、再基于条款生成回答，每条结论都能追溯到「哪份文件、第几条、第几页」的原文。
@@ -52,7 +54,7 @@
   先把问题改写成完整问句再检索（"那颜色呢" → "安全帽的颜色有什么要求？"），
   回答上方会标注"结合上下文理解为「…」"，改写失败自动回退原问题；
 - **范围限定**：可以只在勾选的一篇或几篇规范里检索，而不是全库。范围条件下推到
-  向量库的元数据过滤（Chroma `where`），不是"先全库召回再在应用层丢掉"；
+  向量库的元数据过滤（下推成 Qdrant 的 payload 条件），不是"先全库召回再在应用层丢掉"；
 - **引用溯源**：每条回答下方有引用卡片，标明来源文档名、条款号、PDF 页码、原文片段和相似度分数；
   点"原文"直接跳到该篇文档的对应条款；
 - 左侧可调参数：召回条数 topK。
@@ -81,7 +83,7 @@
 
 ## 快速开始
 
-三分钟跑起来，最少只要一个可用的 Chroma 和一条 OpenAI 兼容接口的 API Key。
+三分钟跑起来，最少只要一个可用的 Qdrant 和一条 OpenAI 兼容接口的 API Key。
 
 ```bash
 # 1. 起向量库（本机装 Docker 时一条命令搞定）
@@ -97,12 +99,12 @@ mvn spring-boot:run
 open http://localhost:8080   # 首次启动自动导入 sample_docs/ 示例规范，直接就能问
 ```
 
-Chroma 不在本机时：`export CHROMA_HOST=http://<ip>`。没有 key 想看效果：加 `APP_DEMO_MODE=true`
+Qdrant 不在本机时：`export QDRANT_HOST=<ip>`（裸 IP，不要带 `http://`）。没有 key 想看效果：加 `APP_DEMO_MODE=true`
 切到离线演示模式（见文末[「演示模式说明」](#演示模式说明无-api-key-时)）。完整的 IDEA 启动与
 `restart.sh` 用法见[「运行步骤」](#运行步骤intellij-idea)。
 
 > 向量库是必要依赖，**连不上会直接启动失败**（不会静默降级）。起来后建议先花 1 分钟自检：
-> `python tools/chroma_selfcheck.py --url http://localhost:8000`。
+> `python tools/qdrant_selfcheck.py --url http://localhost:6333`。
 
 ## 技术栈
 
@@ -111,7 +113,7 @@ Chroma 不在本机时：`export CHROMA_HOST=http://<ip>`。没有 key 想看效
 | 语言 / 运行时 | Java 21（pom 中 `java.version=21`、`maven.compiler.release=21`） |
 | 框架 | Spring Boot 3.4.5 + **Spring AI 1.0.0**（spring-ai-bom 统一版本） |
 | 构建 | Maven 3.9.12，IntelliJ IDEA 直接打开 pom.xml 导入 |
-| 向量库 | **Chroma 0.5.23**（Docker，可本机也可在虚拟机/远程），通过 Spring AI `VectorStore` 抽象接入 |
+| 向量库 | **Qdrant 1.13.6**（Docker，可本机也可在虚拟机/远程，REST 6333 / gRPC 6334），通过 Spring AI `VectorStore` 抽象接入 |
 | 模型 | OpenAI 兼容接口（`spring-ai-starter-model-openai`），默认指向通义千问兼容端点，可换 Kiwi |
 | Embedding | 默认 `text-embedding-v3`（通义）；可换任意兼容端点的 bge 系列模型名 |
 | 文档解析 | PDFBox（PDF 逐页，保留页码）+ Apache Tika（docx/doc/wps/pptx/xlsx/html） |
@@ -155,7 +157,7 @@ Chroma 不在本机时：`export CHROMA_HOST=http://<ip>`。没有 key 想看效
 | `etl/DocumentIngestService.java` | ETL：按扩展名选 Reader（PDF 逐页带页码 / TXT / Word 等走 Tika），切分并按顺序回溯补齐 clause |
 | `etl/SampleDataInitializer.java` | 首次启动自动导入 `sample_docs/` 示例规范，开箱可问 |
 | `rag/Bm25Index.java` | **自研 BM25**：纯 Java 实现（字符 bigram 分词 + Okapi BM25 公式），并附带查询词项覆盖率供录取判定 |
-| `rag/HybridRetriever.java` | 混合检索：向量 + BM25 两路召回，向量路做绝对阈值 + 范围限定（下推 Chroma `where`），两路按 **RRF（倒数排名融合）** 合并——用名次不用分数，避开两路量纲不可比的问题 |
+| `rag/HybridRetriever.java` | 混合检索：向量 + BM25 两路召回，向量路做绝对阈值 + 范围限定（下推 Qdrant payload 过滤），两路按 **RRF（倒数排名融合）** 合并——用名次不用分数，避开两路量纲不可比的问题 |
 | `rag/QuestionRewriter.java` | 多轮追问改写：仅在"有历史"且"问题过短或含指代词"时才调模型改写，失败回退原问题 |
 | `rag/RetrievedChunk.java` | 检索结果载体（Document + 排序分 + 向量分 + BM25 分，展示与排序分开） |
 | `service/ChatService.java` | 问答主链路：改写 → 检索 → 无召回拦截 → 手写组装 Prompt → 调用模型 / 抽取式降级 |
@@ -164,12 +166,13 @@ Chroma 不在本机时：`export CHROMA_HOST=http://<ip>`。没有 key 想看效
 | `service/IngestJobService.java` | 批量入库任务：落盘即返回 taskId，单线程顺序入库并逐块上报进度，单文件失败不影响其余 |
 | `service/DocumentRegistry.java` | 文档注册表（`data/registry.json`）：补齐 VectorStore 抽象没有的"文档级管理"能力 |
 | `config/DemoModeConfig.java` | 演示模式：本地兜底 EmbeddingModel（字符 n-gram 哈希向量），无 key 可跑 |
-| `config/VectorStoreConfig.java` | **Chroma 装配**：自己建 tenant/database/collection，绕开 Spring AI"精确匹配错误文案"的集合判断 |
+| `config/VectorStoreConfig.java` | **Qdrant 装配**：显式建集合（维度即契约）、建 payload 索引、启动时校验维度，用 gRPC 连接 |
 | `config/HostsFileGuard.java` | **启动守卫**：`-Djdk.net.hosts.file` 指向不可用文件时自动清除并回退系统 DNS（JDK 在该设置失效时不会 fallback，会让所有外部请求直接失败，见"hosts 绕行也可能反噬"） |
 | `config/CachingEmbeddingModel.java` | **Embedding 批量预取装饰器**：把逐块调用合并成 5 条/请求，失败自动拆小重试（见下节） |
 | `config/HttpClientConfig.java` | 把流式用的 WebClient 换成 JDK HttpClient 传输层，与非流式保持一致（见"卡住 19 秒"一节） |
 | `tools/pin_dashscope_ip.py` | 逐个探测百炼的 A 记录，挑出"上行大包能通"的 IP 写入 `hosts`，绕开 PMTU 黑洞 |
-| `tools/chroma_selfcheck.py` | Chroma 服务端自检：模拟 600 块分批写入，判断这台机器的 Chroma 扛不扛得住（只用标准库） |
+| `tools/qdrant_selfcheck.py` | Qdrant 服务端自检：建集合 → 写 600 条 → 删不存在的 id → 按 payload 删除，验证幂等与吞吐（只用标准库） |
+| `tools/migrate_to_qdrant.py` | 把 Chroma 里的向量整库搬到 Qdrant（含 payload 与原文），换库不必重新算 embedding |
 | `web/ChatController.java` | `/api/chat`、`/api/chat/stream`（SSE：rewrite / token / citations 事件） |
 | `web/KnowledgeBaseController.java` | `/api/kb/documents`、`/api/kb/preview`（入库预检）、`/api/kb/uploads`（批量上传 + 进度查询）、`/api/kb/paste`（粘贴入库）、`/api/kb/reindex`、`/api/kb/stats`、`/api/kb/search-test`、`/api/kb/eval`（检索评测）、`/api/kb/documents/{docId}/chunks`（块原文，支持过滤与分页） |
 | `web/ApiExceptionHandler.java` | 全局异常映射：400/404/409/413/500 与一句可读文案，替代"一律 500 + 堆栈" |
@@ -433,12 +436,12 @@ SSE 流式事件序列：`rewrite`（多轮改写结果）→ 一串 `token`（�
 环境要求：**JDK 21**、**Maven 3.9.12**（IDEA 设置里把 Maven home 指到 3.9.12、JDK 指到 21 即可）。
 
 1. **导入工程**：IDEA → Open → 选择本目录的 `pom.xml` → 以 Maven 工程导入，等待依赖下载完成。
-2. **先起向量库**：向量库是必要依赖（本工程只保留 Chroma 一套实现），默认连 `http://localhost:8000`。
-   - 本机有 Docker：在工程目录 `docker compose up -d`，一条命令搞定；
-   - Chroma 在虚拟机/另一台机器：确认端口可达，然后设环境变量 `CHROMA_HOST=http://<ip>`，
-     或在运行配置的 Program arguments 里写 `--spring.ai.vectorstore.chroma.client.host=http://<ip>`；
-   - 起来后先自检：`python tools/chroma_selfcheck.py --url http://<ip>:8000`。
-   具体见下方「向量库（Chroma）怎么起」。**连不上时应用会直接启动失败并给出提示**，不会静默降级。
+2. **先起向量库**：向量库是必要依赖（本工程只保留 Qdrant 一套实现），默认连 `localhost:6334`（gRPC）。
+   - 本机有 Docker：在工程目录 `docker compose up -d`，一条命令搞定（**必须同时映射 6333 和 6334**）；
+   - Qdrant 在虚拟机/另一台机器：确认两个端口都可达，然后设环境变量 `QDRANT_HOST=<ip>`（裸 IP，别带 `http://`），
+     或在运行配置的 Program arguments 里写 `--spring.ai.vectorstore.qdrant.host=<ip>`；
+   - 起来后先自检：`python tools/qdrant_selfcheck.py --url http://<ip>:6333`。
+   具体见下方「向量库（Qdrant）怎么起」。**连不上时应用会直接启动失败并给出提示**，不会静默降级。
 3. **配置模型**：默认 `app.demo-mode=false`，即走真实模型，需要可用的 `LLM_API_KEY`。
    手上暂时没有 key 时，给运行配置加上环境变量 `APP_DEMO_MODE=true` 即可切到离线演示模式（见文末「演示模式说明」）。接真实模型时，二选一：
    - 改 `src/main/resources/application.yml` 里的 `spring.ai.openai.*` 与 `app.demo-mode: false`；
@@ -453,7 +456,7 @@ SSE 流式事件序列：`rewrite`（多轮改写结果）→ 一串 `token`（�
 5. **访问**：浏览器打开 http://localhost:8080 ，左侧切换「对话 / 知识库」两个菜单。
    首次启动会自动把 `sample_docs/` 里的示例规范入库，直接就能提问。
 
-> 启动日志里会打印 `Chroma 服务地址：...` 和 `当前 VectorStore 实现：ChromaVectorStore ...`，
+> 启动日志里会打印 `Qdrant 服务地址：...` 和 `当前 VectorStore 实现：QdrantVectorStore ...`，
 > 知识库菜单的「索引统计」里 `vectorStore` 字段也能确认。
 
 ### 改完代码怎么重启（`restart.sh`）
@@ -468,98 +471,110 @@ PORT=8080 bash restart.sh    # 换端口
 SKIP_BUILD=1 bash restart.sh # 只重启不打包
 NO_TEST=0 bash restart.sh    # 打包时顺带跑全量测试
 PIN_IP=1 bash restart.sh     # 先探测并固定百炼接入 IP 再启动（见下方说明）
-CHROMA_HOST=http://192.168.1.20 bash restart.sh   # Chroma 不在本机时
+QDRANT_HOST=192.168.1.20 bash restart.sh   # Qdrant 不在本机时
 ```
 
 脚本会做三件额外的事：按端口反查并杀掉旧进程（Git Bash 的 `$!` 拿的是 MSYS 虚拟 pid，
 `taskkill` 认不了，所以统一走端口）、识别「薄 jar」并直接报错、轮询 `/api/kb/stats`
 确认真的起来了才返回。日志固定写到 `.run.log`。
 
-Chroma 地址按「`CHROMA_HOST` 环境变量 → 项目根 `.chroma-host` 文件 → `http://localhost:8000`」
-的顺序取；`.chroma-host` 已在 `.gitignore` 里，适合放本机常用的虚拟机地址，免得每次都带参数。
+Qdrant 地址按「`QDRANT_HOST` 环境变量 → 项目根 `.qdrant-host` 文件 → `localhost`」
+的顺序取；`.qdrant-host` 已在 `.gitignore` 里，适合放本机常用的虚拟机地址，免得每次都带参数。
+脚本会自动去掉误写的 `http://` 前缀——Qdrant 走 gRPC，配置项要的是裸主机名。
 
 > **关于 `PIN_IP`（固定百炼 IP）**：默认**不**固定，走 DNS 轮询。只有当你又遇到
 > "模型调用 ~19 秒后 `Connection reset`、回答降级成抽取式"时，才用 `PIN_IP=1 bash restart.sh`
 > 重新探测并固定一个能通大包的 IP。原因是这个绕行只对「确实存在 PMTU 黑洞」的网络有效，
 > 网络环境变了之后固定下来的 IP 可能反而失效（本项目实测踩到过），所以宁可默认关闭、需要时显式打开。
 
-### 向量库（Chroma）怎么起
+### 向量库（Qdrant）怎么起
 
-**为什么只留 Chroma**：早期版本另有一套 `SimpleVectorStore`（内存 + 本地 JSON）兜底，
-好处是零依赖，代价是两套写入路径、两套坑，而且它逐块调 embedding，把大文档入库放大成
-几百次 HTTPS。现在统一走 Chroma，只保留一条链路；代价是启动前必须有一个可用的 Chroma 服务
+**为什么只留一套实现**：早期版本并排放过 `SimpleVectorStore`（内存 + 本地 JSON）兜底，
+结果两套写入路径、两套坑，而且它逐块调 embedding，把大文档入库放大成几百次 HTTPS。
+现在统一走 Qdrant，只保留一条链路；代价是启动前必须有一个可用的 Qdrant 服务
 （连不上就启动失败，不会静默降级）。
 
-**推荐顺序：Docker（本机或虚拟机）> WSL2 + pip > Windows 原生 pip（不推荐）**。
-起好后先花 1 分钟确认**这个服务/这条网络扛不扛得住**：
+**Qdrant 相对 Chroma 去掉的坑**（这也是这次换库的主要理由）：
+
+| Chroma 上的问题 | Qdrant 上的表现 |
+|---|---|
+| Spring AI 靠**精确匹配错误文案**判断集合是否存在，真实文案对不上 → 空库永远起不来 | 有 `collectionExists` 明确接口，不依赖文案 |
+| 删除**不存在的 id** 会在原生层段错误，服务端直接退出 | 删除是幂等的，不存在的 id 直接忽略 |
+| Windows 原生 pip 版写入必崩（`chroma-hnswlib`） | 单二进制 / 官方镜像，没有原生轮子的坑 |
+| 数据目录不能被不同版本交替打开，否则写入时崩 | 存储格式稳定，升级不用清库 |
+| 只能按 id 删除，删一篇要先捞全库 id 求交集 | 支持按 payload 条件删除（`docId` 过滤），一次请求删完整篇 |
+
+#### 先自检，再动数据
 
 ```bash
-python tools/chroma_selfcheck.py --url http://localhost:8000          # 模拟 600 块 × 1024 维分批写入
-python tools/chroma_selfcheck.py --url http://localhost:8000 --ghost  # 再测"删除不存在的 id"
+python tools/qdrant_selfcheck.py --url http://localhost:6333
 ```
 
-脚本只依赖标准库，任何方式起的 Chroma 都能测。两项都通过再往下走。
+脚本只依赖标准库，会依次验证：连通性 → 建集合与 payload 索引 → 写 600 条（1024 维）
+→ exact count 校验 → 删除不存在的 id（幂等） → 按 payload 删除 → 清理临时集合。
+本机实测写入约 **990 条/秒**，600 条一共 600 毫秒左右。
 
-#### 路径 A：Docker（推荐，本机或虚拟机都行）
+#### Docker 部署（推荐，本机或虚拟机都行）
 
-工程自带 `docker-compose.yml`，已锁 `chromadb/chroma:0.5.23`、端口 `8000:8000`、
-数据卷 `./data/chroma-server`：
+工程自带 `docker-compose.yml`，已锁 `qdrant/qdrant:v1.13.6`，两个端口都映射：
 
 ```bash
 docker compose up -d
 docker compose ps
-curl -s localhost:8000/api/v1/heartbeat
+curl -s localhost:6333/healthz          # 期望：healthz check passed
+curl -s localhost:6333/collections
 ```
 
-放在虚拟机里跑也完全可以（Windows 本机连 Docker 都不用装），要点只有三条：
-`-p 8000:8000` 别绑成 `127.0.0.1`、挂载目录在 SELinux 环境要加 `:Z`、然后把应用侧的
-`CHROMA_HOST` 指到虚拟机 IP。CentOS 7 + Docker 26 上实测：600 块自检通过，
-1436 块重建索引约 30 秒，跨虚拟机网络不是瓶颈。
+**两个端口缺一不可**：
 
-Docker Hub 直连慢时用镜像加速或带前缀的镜像名（如 `docker.m.daocloud.io/chromadb/chroma:0.5.23`）。
+- `6333` = HTTP / REST / Web UI（浏览器打开 `http://<ip>:6333/dashboard`）
+- `6334` = gRPC，**Spring AI 的 `QdrantVectorStore` 走这个**
 
-#### 路径 B：WSL2 里 pip 安装
+只映射 6333 的典型症状很有迷惑性：dashboard 能打开、`/collections` 也能访问，
+但应用启动时报 `UNAVAILABLE`。遇到这个先查端口映射，别去查代码。
 
-Linux 版 `chroma-hnswlib` 轮子稳定，给 Chroma 一个 Linux 运行环境也够用：
-
-```powershell
-wsl --install -d Ubuntu      # 已装过可跳过，装完需重启
-```
+手动 `docker run` 的等价写法：
 
 ```bash
-# 以下在 Ubuntu 终端里执行
-sudo apt update && sudo apt install -y python3-pip
-pip install "chromadb==0.5.23"
-chroma run --path /home/$USER/chroma-data --host 0.0.0.0 --port 8000
+docker run -d --name safety-rag-qdrant --restart unless-stopped \
+  -p 6333:6333 -p 6334:6334 \
+  -v /data/qdrant-data:/qdrant/storage \
+  -v /data/qdrant-snapshots:/qdrant/snapshots \
+  -e QDRANT__TELEMETRY_DISABLED=true \
+  qdrant/qdrant:v1.13.6
 ```
 
-WSL2 会把端口转发到 Windows 的 localhost，应用侧用默认配置即可，不用改任何东西。
+**镜像拉不下来怎么办**（实测踩过，值得先知道）：直连 Docker Hub 在国内基本超时；
+用加速站时，一个 300MB 的镜像要发 8 个 blob 请求，很容易中途被上游限流，
+日志表现为**所有层都 `Download complete`，却一个 `Pull complete` 都没有**，
+或者直接抛 `toomanyrequests`。已下载的层会被缓存，所以**重试几次就能逐步累积到完成**，
+不必换源也不必改配置。实测 `docker.m.daocloud.io/qdrant/qdrant:v1.13.6` 反复重试后可拉全。
 
-- 必须 `--host 0.0.0.0`（不是 `localhost`），否则 Windows 侧连不进来；
-- 数据放 WSL 的 `/home/...` 下，别放 `/mnt/c`（跨文件系统 IO 很慢）。
+#### 版本要点
 
-#### 路径 C：Windows 原生 pip（不推荐，实测会崩）
+- **服务端 1.13.6 对应客户端 1.13.0**：Spring AI 1.0.0 传递依赖的是 `io.qdrant:client:1.13.0`，
+  服务端选同代版本最稳（gRPC 协议向后兼容，但没必要给自己找跨代的麻烦）。
+- **维度是建库契约**：Chroma 插入时才确定维度，Qdrant 在 `createCollection` 时就定死 `size`。
+  换 embedding 模型必须同时改 `app.vector-dimension` 并重建集合，否则写入直接报错。
+  好处是这类错误会在启动阶段就被 `VectorStoreConfig` 拦下来（它会对比集合实际维度与配置）。
+- **payload 里正文的键名是 `doc_content`**：这是 Spring AI 的约定，不是我们自己起的名字。
+  迁移脚本和手工 scroll 都要按这个键名写，否则检索回来 `getText()` 是空。
 
-本机（Windows + Python 3.9 + chromadb 0.5.23）复现过的现象：
+#### 从 Chroma 迁数据
 
-| 操作 | 结果 |
-|---|---|
-| 10 条一批 upsert，总量 < 100 | ✅ 200 正常 |
-| 删除**存在的** id | ✅ 正常 |
-| 删除**不存在的** id | ❌ 服务端 exit 139（段错误），进程消失 |
-| 连续写到一百多块（HNSW 扩容） | ❌ 同样 exit 139 |
-| 直接调 `chroma-hnswlib.add_items`（dim=4、2 条） | ❌ 也崩 → 原生轮子本身有问题 |
+如果手里已经有一库 Chroma 数据，不必重新算 embedding（1436 块约等于 300 次付费请求）：
 
-把 numpy 降到 1.26 无效；0.5.23 与 0.6.3 都能复现。客户端只能看到
-`Connection reset` / `Connection refused`，服务端日志没有堆栈，很容易误判成应用 bug。
-**这条路走到一半就会崩，别在上面耗时间。**
+```bash
+python tools/migrate_to_qdrant.py \
+    --chroma http://<chroma-host>:8000 \
+    --qdrant http://<qdrant-host>:6333 \
+    --collection safety-regulations
+```
 
-工程侧仍做了两处防御：自己建集合（不依赖 Spring AI 的错误文案匹配）、删除前先核对
-**真实存在的 id** 再删——后者在 Docker/Linux 版上同样有用，因为"注册表有、向量库没有"
-的不一致很容易出现（清空过数据、上次入库中途失败）。
+脚本按 200 条/页从 Chroma 导出 id、向量、metadata 与原文，再按 100 条/批写入 Qdrant
+（payload = metadata 平铺 + `doc_content`），最后用 exact count 校验条数。
+`chunkId` 两边都是同一个 UUID，所以注册表 `data/registry.json` 可以原样搬过来，不用重建。
 
-> 版本要点：**同一个 Chroma 数据目录不要被不同版本交替打开**。
-> 0.6.x 读 0.5.x 写的 HNSW 段文件，写入时会段错误（已实测）。换版本就换目录，或清空重建。
 
 ### 为什么没有本地兜底
 
@@ -571,7 +586,8 @@ WSL2 会把端口转发到 Windows 的 localhost，应用侧用默认配置即�
   排查问题时先要确认"你用的是哪套"，沟通成本高于收益；
 - **生产形态本来就该是独立向量服务**：换机器、扩容、多实例共用一个库，本地 JSON 都做不到。
 
-现在只有一条链路：Chroma。启动时连不上就是启动失败，错误信息里直接给可执行的下一步。
+现在只有一条链路：Qdrant。启动时连不上就是启动失败，错误信息里直接给可执行的下一步——
+连不上 gRPC、端口只映射了 6333、集合维度与配置不一致，三种情况各有各的提示。
 
 ### 演示模式说明（无 API key 时）
 
@@ -609,7 +625,8 @@ JVM 的 HTTP 连接池复用到这条已经失效的连接时就报这个错；�
 | `spring.ai.openai.api-key` | 模型 API key（环境变量 `LLM_API_KEY`） |
 | `spring.ai.openai.chat.options.model` | 聊天模型，默认值见 `application.yml`（可用 `LLM_CHAT_MODEL` 覆盖）；须填服务端真实支持的模型名 |
 | `spring.ai.openai.embedding.options.model` | 向量模型，默认 `text-embedding-v3`（1024 维）；换 bge 系列时改这里的模型名即可（如服务端部署的 `bge-large-zh-v1.5`） |
-| `spring.ai.vectorstore.chroma.*` | 向量库地址端口（`CHROMA_HOST` / `CHROMA_PORT`）、tenant/database、集合名 |
+| `spring.ai.vectorstore.qdrant.*` | 向量库地址与集合名（`QDRANT_HOST` / `QDRANT_GRPC_PORT`）；端口是 gRPC 的 6334，不是 6333 |
+| `app.vector-dimension` | 向量维度（环境变量 `EMBEDDING_DIMENSION`），Qdrant 建集合时定死，换 embedding 模型必须同步改 |
 | `app.demo-mode` | 演示模式开关（环境变量 `APP_DEMO_MODE`），默认 `false` |
 | `app.chunking.chunk-size / overlap` | 切分参数：单块最大字符数 / 预留重叠量 |
 | `app.retrieval.min-score` | **向量路**的最低相似度，低于它视为无召回（防编造的第一道门槛）。默认 `0.60`，取值依据见下 |
@@ -652,14 +669,15 @@ JVM 的 HTTP 连接池复用到这条已经失效的连接时就报这个错；�
 data/
 ├── docs/            上传的原始文档（重建索引的数据来源），文件名为 docId__原名
 ├── registry.json    文档注册表（文档与块的元信息、块原文）
-└── chroma-server/   仅当用 docker compose 在本机跑 Chroma 时的数据卷
+└── qdrant-storage/  仅当用 docker compose 在本机跑 Qdrant 时的数据卷
 
-向量本身不在这里：本机 compose 时落在上面的 chroma-server/，
-连虚拟机/远程 Chroma 时在对方磁盘上。--app.data-dir 只影响 docs/ 与 registry.json。
+向量本身不在这里：本机 compose 时落在上面的 qdrant-storage/，
+连虚拟机/远程 Qdrant 时在对方磁盘上（用 `docker volume inspect` 或 `-v` 参数确认挂载点）。
+--app.data-dir 只影响 docs/ 与 registry.json。
 sample_docs/         随工程自带的示例规范（自拟文本，非正式规范原文）
 ```
 
-> **换了 Embedding 模型（或开关演示模式）一定要"重建索引"**：Chroma 里存的是旧模型算出的
+> **换了 Embedding 模型（或开关演示模式）一定要"重建索引"**：Qdrant 里存的是旧模型算出的
 > 向量，新旧向量维度可能一样（都是 1024），混在一起不会报错，但余弦相似度不在同一量纲上——
 > 真实语义向量（0.5 上下）会把哈希兜底向量（0.0x）整体压死，表现为"老文档怎么都搜不到"。
 > 现在没有本地向量文件可做模型标识比对，**这一步只能靠人记住**：改模型就点一次"重建索引"。
@@ -705,13 +723,16 @@ mvn test
   于是模型调用、查询向量化、维度探测全部失败。三个症状其实是一个根因。
   确认办法：启动日志里搜 `HostsFileGuard`，或临时 `curl` 直连百炼看是否 401 秒回（通就说明网络没问题）。
   处理：删掉 IDEA 运行配置 VM options 里那个参数（新版本代码已会自动清除并打 WARN，但建议手工清理干净）。
-- **上传文档 / 重建索引 时报"入库失败"，且 Chroma 进程不见了**：
-  说明 Chroma 服务端自己崩了（exit 139 段错误），不是应用逻辑问题。已知触发点：删除不存在的 id、
-  索引扩容时 HNSW 重建——这两点在 **Windows 原生 pip 版**上必现（见上文实测表），Docker/Linux 版没有。
-  确认办法：看 Chroma 容器状态、`curl <chroma>/api/v2/heartbeat` 是否还通。
-  处理：① 换成 Docker（本机或虚拟机）里的 Linux 版 Chroma；
-  ② 若只是数据不一致，清空 Chroma 数据目录后重启应用（会自动建集合）再点"重建索引"。
-- **启动就报 `Collection safety-regulations does not exist.`**：这是 Spring AI 1.0.0 用"精确匹配错误文案"判断集合是否存在的 bug（真实 Chroma 返回的文案对不上），本工程已用 `config/VectorStoreConfig` 接管集合创建；如果你还看到这个报错，说明跑的是旧代码，重新编译即可。
+- **启动报 `UNAVAILABLE` 或 `failed to connect`**：九成是端口映射问题。Qdrant 要**两个**端口——
+  `6333` 给 REST/dashboard，`6334` 给 gRPC，而应用只走 6334。只映射 6333 时 dashboard 能开、
+  应用却连不上，很容易误判成代码问题。确认办法：`docker ps` 看 PORTS 是否两个都在，
+  再 `curl <host>:6333/healthz` 与 `telnet <host> 6334` 分别验证。
+- **启动报「向量维度是 X，但配置 app.vector-dimension=Y」**：说明换了 embedding 模型但没重建集合。
+  Qdrant 的维度是建库时定死的，不能像 Chroma 那样"混进去再说"。二选一：把配置改回 X，
+  或删集合（`curl -X DELETE http://<host>:6333/collections/safety-regulations`）后点"重建索引"。
+- **`docker pull` 卡在 `Download complete`、一个 `Pull complete` 都没有**：这是加速站把上游
+  限流了（日志里可能出现 `toomanyrequests`）。已下载的层会被缓存，**重复 pull 几次就能累积完成**，
+  不必换源、也不必改配置。
 - **回答总是"未找到相关规范"**：先在知识库菜单确认文档已入库；再到"检索测试"看召回分数，必要时调低 `app.retrieval.min-score`。（`min-score`、`min-bm25-score` 等检索参数改完即时生效，只有切分参数才需要"重建索引"。）
 - **无关问题也硬答**：说明门槛太松 —— 检查 `min-score` 是否被设成 0，以及两个 BM25 门槛是否被显式填 0（0 表示关闭）。
 - **改了切分参数不生效**：切分只发生在入库时，改完参数后在知识库菜单点"重建索引"。
@@ -720,8 +741,12 @@ mvn test
   判断办法：拖进阅读器能选中文字就是有文字层。
 - **批量上传时某个文件一直"排队中"**：入库是单线程串行跑的，前面的大文件没跑完后面就会排队；
   查 `GET /api/kb/uploads/{jobId}` 能看到当前在跑哪个文件、已经向量化到第几块。
-- **换了 Embedding 模型 / 开关了演示模式后检索结果全乱**：Chroma 里存的是旧模型算出的向量，
-  两组向量不能混用。到知识库菜单点一次"重建索引"即可（先删旧向量，再按 `data/docs/` 重新向量化；
-  1436 块实测约 30 秒，取决于 embedding 接口速度）。
-- **"删除文档"删干净了吗**：删。删除前先从 Chroma 取回"真实存在的 id"求交集再删——
-  删不存在的 id 会让 0.5.x 服务端段错误。实测文档删除后集合条数 1440 → 1436，与注册表一致。
+- **换了 Embedding 模型 / 开关了演示模式后检索结果全乱**：Qdrant 里存的是旧模型算出的向量，
+  两组向量不能混用。到知识库菜单点一次"重建索引"即可（先按 docId 删旧向量，再按 `data/docs/`
+  重新向量化；1436 块实测约 30 秒，取决于 embedding 接口速度）。若维度也变了，先改
+  `app.vector-dimension` 并删集合，否则写入会被 Qdrant 直接拒绝。
+- **"删除文档"删干净了吗**：删，而且比 Chroma 时代更彻底。Qdrant 支持按 payload 条件删除，
+  所以 `delete(docId)` 是**一次请求删完整篇**（`filter.must[docId === "xxx"]`），不再需要
+  "先分页捞全库 id 求交集"；删不存在的点也只是幂等返回，不会让服务端崩。
+  验证办法：`curl -X POST <host>:6333/collections/safety-regulations/points/count -d '{"exact":true}'`，
+  删完文档后点数应正好减少该文档的块数。

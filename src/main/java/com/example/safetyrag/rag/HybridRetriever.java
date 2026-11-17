@@ -2,6 +2,7 @@ package com.example.safetyrag.rag;
 
 import com.example.safetyrag.config.AppProperties;
 import com.example.safetyrag.service.DocumentRegistry;
+import com.example.safetyrag.util.VectorStoreErrors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
@@ -9,7 +10,6 @@ import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.ResourceAccessException;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -60,16 +60,27 @@ public class HybridRetriever {
     }
 
     /**
-     * 向量检索的连接重试：与入库侧同一原因——Chroma(uvicorn) 会关闭闲置连接，
-     * 连接池复用到失效连接时报 Connection reset。检索是只读操作，重试安全；
-     * 重试仍失败才抛出，由调用方降级为纯 BM25。
+     * 向量检索的连接重试。
+     *
+     * <p>Chroma 时代的触发原因是 uvicorn 只保留约 5 秒空闲连接，连接池复用失效连接
+     * 就报 Connection reset；Qdrant 走 gRPC 长连接，那个坑不存在了。但服务重启、
+     * 网络抖动仍会抛 UNAVAILABLE，检索是只读操作、重试安全，所以保留这层薄保护。</p>
+     *
+     * <p><b>移植时踩到的坑：</b>异常类型跟着传输层一起变了——Chroma 抛
+     * {@code ResourceAccessException}，Qdrant 抛 gRPC 的 {@code StatusRuntimeException}。
+     * 如果沿用原来的 {@code catch (ResourceAccessException)}，这段重试在 Qdrant 下
+     * 永远不会触发，表现为"偶发连接失败直接冒到用户面前"。所以判定统一收到
+     * {@link VectorStoreErrors#isConnectionFailure} 里。</p>
      */
     private List<Document> similaritySearchWithRetry(SearchRequest request) {
-        ResourceAccessException last = null;
+        RuntimeException last = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
                 return vectorStore.similaritySearch(request);
-            } catch (ResourceAccessException e) {
+            } catch (RuntimeException e) {
+                if (!VectorStoreErrors.isConnectionFailure(e)) {
+                    throw e;
+                }
                 last = e;
                 log.warn("向量检索第 {} 次连接失败，重试：{}", attempt, e.getMessage());
                 try {
@@ -112,6 +123,7 @@ public class HybridRetriever {
     }
 
     public List<RetrievedChunk> retrieve(Options opts) {
+        long started = System.currentTimeMillis();
         String query = opts.query();
         int topK = opts.topK();
         Set<String> docIds = opts.docIds() == null ? Set.of() : opts.docIds();
@@ -130,9 +142,11 @@ public class HybridRetriever {
                     .query(query)
                     .topK(candidateN)
                     .similarityThreshold(0.0); // 阈值过滤在下面手动做，便于统一口径和日志
-            // 范围限定下推到向量库：Chroma 会把 filterExpression 转成 where 子句，
-            // 先筛元数据再算距离，比「先召回再在应用层丢掉」准得多——
+            // 范围限定下推到向量库：Qdrant 会把 filterExpression 翻译成 payload 的
+            // must 条件，先筛元数据再算距离，比「先召回再在应用层丢掉」准得多——
             // 后者在限定范围很小时，topK 条可能被范围外的块占满，看起来像无召回。
+            // 这里用的是 Spring AI 的通用 Filter.Expression，两个向量库实现都支持，
+            // 所以换库时这段代码一行都没改（只有注释变了）。
             Filter.Expression docFilter = docFilter(docIds);
             if (docFilter != null) {
                 requestBuilder.filterExpression(docFilter);
@@ -156,7 +170,7 @@ public class HybridRetriever {
                 applySpikeGate(cfg, query, vectorScores, vectorRank, merged);
             }
         } catch (Exception e) {
-            // 向量库不可用（如 Chroma 未启动）时不让整个问答崩掉，降级为纯 BM25
+            // 向量库不可用（如 Qdrant 未启动）时不让整个问答崩掉，降级为纯 BM25
             vectorFailed = true;
             log.warn("向量检索失败，降级为纯 BM25 召回：{}", e.getMessage());
         }
@@ -257,7 +271,21 @@ public class HybridRetriever {
         }
 
         // ---------- 按最终分截断 ----------
-        return results.size() > topK ? new ArrayList<>(results.subList(0, topK)) : results;
+        List<RetrievedChunk> finalHits = results.size() > topK
+                ? new ArrayList<>(results.subList(0, topK)) : results;
+
+        // 检索留痕。为什么值得单独打一条 INFO：向量库的 dashboard（无论 Qdrant 还是
+        // Chroma）都只显示"库里有什么"，不记录"应用发了什么查询"，出问题时唯一的
+        // 现场还原手段就是这行日志。它同时能回答答辩常问的"你怎么证明检索真的生效了"。
+        if (!finalHits.isEmpty() && log.isInfoEnabled()) {
+            RetrievedChunk top = finalHits.get(0);
+            log.info("检索：query=「{}」向量命中={} BM25命中={} 返回={} 块 首选={} {} 分={} 耗时={}ms",
+                    query, vectorScores.size(), bm25Scores.size(), finalHits.size(),
+                    top.document().getMetadata().get("docName"),
+                    top.document().getMetadata().getOrDefault("clause", ""),
+                    round4(top.score()), System.currentTimeMillis() - started);
+        }
+        return finalHits;
     }
 
     /**
@@ -324,9 +352,11 @@ public class HybridRetriever {
     }
 
     /**
-     * 把「限定文档」翻译成 Chroma 的元数据过滤表达式。
-     * 单篇用 EQ、多篇用 IN：Chroma 的 where 对单值等值判断走索引更稳，
-     * 也避免 IN 列表只有一项时部分版本的解析差异。
+     * 把「限定文档」翻译成向量库的元数据过滤表达式。
+     *
+     * <p>单篇用 EQ、多篇用 IN 是通用写法：单值等值判断对索引最友好，也避免 IN 列表
+     * 只有一项时不同实现在解析上的差异。Qdrant 侧最终会变成
+     * {@code filter.must[docId === "xxx"]}，配合启动时建的 keyword 索引走索引过滤。</p>
      */
     private static Filter.Expression docFilter(Set<String> docIds) {
         if (docIds == null || docIds.isEmpty()) {

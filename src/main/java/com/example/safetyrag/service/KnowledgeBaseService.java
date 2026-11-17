@@ -6,21 +6,23 @@ import com.example.safetyrag.etl.DocumentIngestService;
 import com.example.safetyrag.rag.Bm25Index;
 import com.example.safetyrag.rag.HybridRetriever;
 import com.example.safetyrag.rag.RetrievedChunk;
+import com.example.safetyrag.util.VectorStoreErrors;
 import com.example.safetyrag.web.dto.ChunkDto;
 import com.example.safetyrag.web.dto.ChunkPageDto;
 import com.example.safetyrag.web.dto.DocumentDto;
 import com.example.safetyrag.web.dto.SearchHitDto;
 import com.example.safetyrag.web.dto.StatsDto;
+import io.qdrant.client.ConditionFactory;
+import io.qdrant.client.QdrantClient;
+import io.qdrant.client.grpc.Points.Filter;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chroma.vectorstore.ChromaApi;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -34,6 +36,7 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -43,7 +46,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>数据分工（答辩可讲）：</p>
  * <ul>
- *   <li>向量与相似检索 → Spring AI VectorStore（Chroma）；</li>
+ *   <li>向量与相似检索 → Spring AI VectorStore（Qdrant）；</li>
  *   <li>文档元信息与块原文 → DocumentRegistry（data/registry.json）；</li>
  *   <li>关键词索引 → Bm25Index（内存，启动时按注册表重建）；</li>
  *   <li>原始文件 → data/docs/（重建索引时重新读取切分）。</li>
@@ -62,8 +65,14 @@ public class KnowledgeBaseService {
     private final HybridRetriever retriever;
     private final AppProperties properties;
     private final Path docsDir;
-    /** 直接查 Chroma：删除前先确认"哪些 id 真的存在"（删不存在的 id 会打崩 0.5.x 服务端）。 */
-    private final ChromaApi chromaApi;
+    /**
+     * 直接持有 Qdrant 客户端。
+     *
+     * <p>Chroma 版里这个字段的用途是"删除前先查哪些 id 真实存在"，因为删不存在的 id
+     * 会让服务端段错误。Qdrant 的删除是幂等的，这个防御消失了；保留客户端是为了
+     * 按 docId 做条件删除（一次请求删完整篇，不必拼 id 列表）以及统计点数。</p>
+     */
+    private final QdrantClient qdrantClient;
     /** 向量维度：入库时顺带记录（避免每次查统计都调一次 Embedding 接口）。 */
     private final AtomicInteger cachedDimension = new AtomicInteger(0);
 
@@ -90,18 +99,12 @@ public class KnowledgeBaseService {
     @Value("${spring.ai.openai.embedding.options.model:unknown}")
     private String embeddingModelName;
 
-    @Value("${spring.ai.vectorstore.chroma.collection-name:safety-regulations}")
-    private String chromaCollection;
+    @Value("${spring.ai.vectorstore.qdrant.collection-name:safety-regulations}")
+    private String vectorCollection;
 
-    @Value("${spring.ai.vectorstore.chroma.tenant-name:SpringAiTenant}")
-    private String chromaTenant;
-
-    @Value("${spring.ai.vectorstore.chroma.database-name:SpringAiDatabase}")
-    private String chromaDatabase;
-
-    /** 仅用于区分异常来源（embedding 故障 / Chroma 故障）。 */
-    @Value("${spring.ai.vectorstore.chroma.client.port:8000}")
-    private int chromaPort;
+    /** 仅用于区分异常来源（embedding 故障 / Qdrant 故障）。 */
+    @Value("${spring.ai.vectorstore.qdrant.port:6334}")
+    private int vectorPort;
 
     public KnowledgeBaseService(VectorStore vectorStore,
                                 EmbeddingModel embeddingModel,
@@ -110,7 +113,7 @@ public class KnowledgeBaseService {
                                 Bm25Index bm25Index,
                                 HybridRetriever retriever,
                                 AppProperties properties,
-                                ChromaApi chromaApi) {
+                                QdrantClient qdrantClient) {
         this.vectorStore = vectorStore;
         this.embeddingModel = embeddingModel;
         this.ingestService = ingestService;
@@ -118,7 +121,7 @@ public class KnowledgeBaseService {
         this.bm25Index = bm25Index;
         this.retriever = retriever;
         this.properties = properties;
-        this.chromaApi = chromaApi;
+        this.qdrantClient = qdrantClient;
         this.docsDir = Path.of(properties.dataDirOrDefault(), "docs");
         try {
             Files.createDirectories(docsDir);
@@ -284,28 +287,35 @@ public class KnowledgeBaseService {
     }
 
     /**
-     * 每批交给 VectorStore 的块数。<b>注意它不等于 HTTP 请求数</b>：Chroma 写入时
-     * 内部仍按块调 embedding，真正的请求合并由 {@code CachingEmbeddingModel}
-     * 负责（5 条/请求）。这里分批的意义是控制单次写入的内存与回滚粒度。
+     * 每批交给 VectorStore 的块数。<b>注意它不等于请求数</b>：VectorStore 写入时
+     * 内部仍按块调 embedding（Qdrant 也一样，它只知道向量不知道文本），真正的请求
+     * 合并由 {@code CachingEmbeddingModel} 负责（5 条/请求）。这里分批的意义是
+     * 控制单次写入的内存与回滚粒度。
      */
     private static final int EMBED_BATCH_SIZE = 10;
 
     /**
-     * 向量库增删的连接重试：Chroma 的 uvicorn 服务默认只保留空闲连接约 5 秒，
-     * 而两次向量调用之间隔着 embedding 接口耗时，连接池很容易复用到已被服务端
-     * 关闭的连接，报 Connection reset / received no bytes。增删都是幂等操作，
-     * 失败后连接池会换新连接，重试即可恢复。
+     * 向量库增删的连接重试。
+     *
+     * <p>Chroma 时代的理由是它的 uvicorn 只保留约 5 秒空闲连接；Qdrant 的 gRPC
+     * 长连接没有这个问题，但服务重启、容器重启期间仍会抛 UNAVAILABLE，而增删
+     * 都是幂等操作，重试能免掉一次失败的上传。判定用
+     * {@link VectorStoreErrors#isConnectionFailure}：换库后异常类型从
+     * {@code ResourceAccessException} 变成了 gRPC 的 {@code StatusRuntimeException}，
+     * 沿用旧 catch 会让这段重试静默失效。</p>
      */
     private void withVectorStoreRetry(String action, Runnable op) {
-        ResourceAccessException last = null;
+        RuntimeException last = null;
         for (int attempt = 1; attempt <= 4; attempt++) {
             try {
                 op.run();
                 return;
-            } catch (ResourceAccessException e) {
+            } catch (RuntimeException e) {
+                if (!VectorStoreErrors.isConnectionFailure(e)) {
+                    throw e;
+                }
                 last = e;
-                log.warn("{}第 {} 次失败（疑为空闲连接已被服务端关闭），重试：{}",
-                        action, attempt, e.getMessage());
+                log.warn("{}第 {} 次连接失败，重试：{}", action, attempt, e.getMessage());
                 try {
                     Thread.sleep(500L * attempt);
                 } catch (InterruptedException ie) {
@@ -319,30 +329,32 @@ public class KnowledgeBaseService {
 
     /**
      * 向量写入失败的定位提示。写入路径上有两个网络依赖：先调百炼算 embedding，
-     * 再把向量写进 Chroma，两类故障的处置方式完全不同，按异常内容区分。
+     * 再把向量写进 Qdrant，两类故障的处置方式完全不同，按异常内容区分。
      */
     private String writeFailureHint(Throwable e) {
         String message = String.valueOf(rootMessage(e)).toLowerCase(Locale.ROOT);
         boolean network = message.contains("connection reset") || message.contains("i/o error")
-                || message.contains("timed out") || message.contains("connection refused");
+                || message.contains("timed out") || message.contains("connection refused")
+                || message.contains("unavailable") || message.contains("failed to connect");
         if (!network) {
             return VECTOR_STORE_HINT;
         }
-        if (looksLikeChromaFailure(message)) {
-            return "Chroma 写入失败。" + VECTOR_STORE_HINT;
+        if (looksLikeVectorStoreFailure(message)) {
+            return "Qdrant 写入失败。" + VECTOR_STORE_HINT;
         }
         return "这是调用 Embedding 接口时的网络故障（百炼侧连接被重置），不是文档格式问题。"
                 + "已自动重试多次仍失败，通常稍后重传即可；若持续出现，请检查到 dashscope.aliyuncs.com 的网络/代理是否稳定。";
     }
 
     /**
-     * 异常文案是否指向 Chroma 而不是 embedding 接口。
+     * 异常文案是否指向 Qdrant 而不是 embedding 接口。
      *
-     * <p>Chroma 客户端抛出的连接类异常会带上完整 URI（含端口），embedding 侧的
-     * 异常则指向 dashscope / model 相关的地址，靠这两点区分足够稳。</p>
+     * <p>Qdrant 客户端抛出的 gRPC 异常会带上 {@code UNAVAILABLE}、集合名或 gRPC 端口，
+     * embedding 侧的异常则指向 dashscope / model 相关的地址，靠这些区分足够稳。</p>
      */
-    private boolean looksLikeChromaFailure(String message) {
-        return message.contains("chroma") || message.contains(":" + chromaPort);
+    private boolean looksLikeVectorStoreFailure(String message) {
+        return message.contains("qdrant") || message.contains("collection")
+                || message.contains(":" + vectorPort);
     }
 
     private void addToStores(String docId, String docName, long fileSize, List<Document> chunks,
@@ -418,9 +430,16 @@ public class KnowledgeBaseService {
      * 向量库不可用时给用户的定位提示。上传报错的根因几乎都在环境侧，
      * 但原始异常（Connection reset / 500）看不出该改什么，这里直接给出可操作项。
      */
-    private static final String VECTOR_STORE_HINT = "请检查 Chroma 是否在运行、版本是否与工程一致："
-            + "docker compose 用的是 0.5.23 镜像，用 pip 起服务请固定 chromadb==0.5.23；"
-            + "若曾用 0.6.x 打开过 0.5.x 写的数据目录，写入时服务端会直接崩溃退出，需换回 0.5.23 或清空 data/chroma-server 重建。";
+    /**
+     * 向量库不可用时给用户的定位提示。
+     *
+     * <p>Qdrant 版比 Chroma 版短得多，因为"版本不匹配会崩、数据目录不能跨版本打开"
+     * 这类坑在 Qdrant 上不存在；剩下的失败原因基本都是部署侧的两件事：
+     * 容器没起，或者只映射了 6333（REST）没映射 6334（gRPC）。</p>
+     */
+    private static final String VECTOR_STORE_HINT = "请检查 Qdrant 容器是否在运行、"
+            + "6334（gRPC）端口是否已映射——只开 6333 时 dashboard 能打开但应用连不上；"
+            + "自检命令：curl http://<host>:6333/healthz";
 
     /** 回滚/清理用：删除已写入的向量，失败只记日志，不掩盖原始异常。 */
     private void deleteVectorsQuietly(List<String> ids) {
@@ -428,12 +447,9 @@ public class KnowledgeBaseService {
             return;
         }
         try {
-            List<String> deletable = existingOnly(ids);
-            if (deletable.isEmpty()) {
-                return;
-            }
-            withVectorStoreRetry("向量回滚", () -> vectorStore.delete(deletable));
-                log.info("已回滚本次写入的 {} 条向量", deletable.size());
+            // Qdrant 的删除是幂等的：id 不存在也只是返回成功，不需要像 Chroma 那样先求交集
+            withVectorStoreRetry("向量回滚", () -> vectorStore.delete(ids));
+            log.info("已回滚本次写入的 {} 条向量", ids.size());
         } catch (Exception e) {
             log.warn("回滚 {} 条向量失败，向量库中可能残留脏数据（可在知识库菜单点『重建索引』清理）：{}",
                     ids.size(), e.getMessage());
@@ -441,59 +457,32 @@ public class KnowledgeBaseService {
     }
 
     /**
-     * 查询向量库中**真实存在**的块 id。
+     * 按 docId 条件删除整篇文档的向量。
      *
-     * <p>为什么必须查：Chroma（0.5.23 与 0.6.3 表现一致）在删除**不存在的 id** 时会在原生
-     * 层段错误，整个服务进程直接退出，客户端只看到 {@code Connection reset}；
-     * 而删除存在的 id 完全正常。可"注册表里的 id"和"向量库里的 id"一旦不一致
-     * （清空过 data/chroma-server、上一次入库中途失败、换了向量模型重建），
-     * 直接按注册表删就必然踩中，表现就是"点重建索引 / 删完文档再上传就报错"。</p>
-     *
-     * @return 存在 id 的集合；拿不到（Chroma 不可用）时返回 {@code null}，
-     *         调用方应据此**跳过删除**，宁可留下旧向量也不要打崩服务
+     * <p>这是 Qdrant 相对 Chroma 最实用的一处能力差别：Chroma 只能按 id 删，
+     * 所以必须先拿到"这篇有哪些 chunkId"再删；Qdrant 可以直接用 payload 过滤，
+     * 即使注册表和向量库的 id 已经对不上，也能靠 docId 把残留清干净。</p>
      */
-    private Set<String> existingVectorIds() {
+    private void deleteByDocId(String docId) {
         try {
-            ChromaApi.Collection collection = chromaApi.getCollection(chromaTenant, chromaDatabase, chromaCollection);
-            Set<String> ids = new HashSet<>();
-            int offset = 0;
-            int page = 500;
-            while (true) {
-                ChromaApi.GetEmbeddingResponse response = chromaApi.getEmbeddings(
-                        chromaTenant, chromaDatabase, collection.id(),
-                        new ChromaApi.GetEmbeddingsRequest(null, null, page, offset));
-                List<String> got = response.ids();
-                if (got == null || got.isEmpty()) {
-                    break;
-                }
-                ids.addAll(got);
-                if (got.size() < page) {
-                    break;
-                }
-                offset += page;
-            }
-            return ids;
-        } catch (Exception e) {
-            log.warn("读取向量库现有 id 失败（{}），本次跳过向量删除以免触发服务端崩溃", e.getMessage());
-            return null;
+            qdrantClient.deleteAsync(vectorCollection, Filter.newBuilder()
+                    .addMust(ConditionFactory.matchKeyword("docId", docId))
+                    .build()).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("按 docId 删除向量时被中断", e);
+        } catch (ExecutionException e) {
+            throw new IllegalStateException("按 docId 删除向量失败：" + rootMessage(e), e);
         }
     }
 
     /**
-     * 从给定 id 中筛出向量库里真实存在的那些。
+     * Chroma 时代这里还有 {@code existingVectorIds()} / {@code existingOnly()} 两个方法：
+     * 删除前把全库 id 分页捞回来求交集，只删"确实存在"的那些。
      *
-     * <p>Chroma 0.5.x 删除**不存在的 id** 会让服务端崩溃退出（详见 README 的实测记录），
-     * 而"注册表里的 id"和"向量库里的 id"很容易不一致（清空过 Chroma、上一次入库中途
-     * 失败、换了向量模型重建）。所以删除前必须先求交集；拿不到现有 id 时宁可返回空、
-     * 跳过向量删除——留下几个孤儿向量只是检索多几条，打崩服务端则是全站不可用。</p>
+     * <p>Qdrant 版把它们删了——它对不存在的 id 删除是幂等的，不会崩溃，
+     * 于是"先查再删"这层防御变成了纯粹的额外开销（每次删除都要全库分页扫描一遍）。</p>
      */
-    private List<String> existingOnly(List<String> ids) {
-        Set<String> existing = existingVectorIds();
-        if (existing == null || existing.isEmpty()) {
-            return List.of();
-        }
-        return ids.stream().filter(existing::contains).toList();
-    }
 
     private static void deleteFileQuietly(Path file) {
         try {
@@ -526,13 +515,10 @@ public class KnowledgeBaseService {
             // 失败，块 id 就随着登记一起消失了，那些向量会永远留在库里却没人认识它们——
             // 检索仍会命中一篇"列表里已经不存在"的文档，页面也再删不掉。
             if (!chunkIds.isEmpty()) {
-                // 先求交集，避免删除不存在的 id 把 Chroma 打崩
-                List<String> deletable = existingOnly(chunkIds);
-                if (!deletable.isEmpty()) {
-                    withVectorStoreRetry("向量删除", () -> vectorStore.delete(deletable));
-                            } else {
-                    log.info("向量库中未找到该文档的块，跳过向量删除：docId={}", docId);
-                }
+                // Qdrant 支持按 payload 条件删除：一次请求清完整篇，不必拼 id 列表。
+                // 相比 Chroma 版必须"先查存在哪些 id 再求交集"，这里少一次全库分页扫描，
+                // 而且删不存在的点不会报错（Chroma 会段错误，那套防御在这里彻底退役）。
+                withVectorStoreRetry("向量删除", () -> deleteByDocId(docId));
             }
             registry.unregister(docId);
             for (String id : chunkIds) {
@@ -581,22 +567,17 @@ public class KnowledgeBaseService {
     }
 
     private ReindexResult doReindex() {
-        // 1) 清空旧索引：一次性销记（只在末尾落一次盘），向量按批删除
+        // 1) 清空旧索引：一次性销记（只在末尾落一次盘），向量按 docId 逐篇删除。
+        //    Chroma 版这里要先分页捞全库 id 求交集（它删不存在的 id 会段错误），
+        //    Qdrant 直接按 docId 过滤删即可，顺带把"注册表里没有、库里却残留"的孤儿向量
+        //    也一起清掉——这比按 id 删更彻底。
         List<String> docIds = registry.listDocuments().stream()
                 .map(DocumentRegistry.DocRecord::docId).toList();
-        List<String> oldChunkIds = registry.unregisterAll(docIds);
-        // 只删向量库里真实存在的 id：删除不存在的 id 会让 Chroma 原生层段错误、服务端直接退出
-        List<String> deletableIds = existingOnly(oldChunkIds);
-        if (deletableIds.size() < oldChunkIds.size()) {
-            log.info("注册表登记 {} 块，向量库中实际存在 {} 块；只删除存在的部分（多出的登记是无向量的僵尸记录）",
-                    oldChunkIds.size(), deletableIds.size());
+        registry.unregisterAll(docIds);
+        for (String docId : docIds) {
+            withVectorStoreRetry("向量删除", () -> deleteByDocId(docId));
         }
-        final int deleteBatch = 500;
-        for (int i = 0; i < deletableIds.size(); i += deleteBatch) {
-            List<String> batch = deletableIds.subList(i,
-                    Math.min(i + deleteBatch, deletableIds.size()));
-            withVectorStoreRetry("向量删除", () -> vectorStore.delete(batch));
-        }
+        log.info("已清空旧向量：{} 篇文档", docIds.size());
         bm25Index.clear();
         // 2) 逐篇重新入库（docId 沿用文件名里的前缀，保持稳定）
         int count = 0;

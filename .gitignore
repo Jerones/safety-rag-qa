@@ -12,6 +12,7 @@ data/
 # ---------- 本机环境相关 ----------
 hosts
 .chroma-host
+.qdrant-host
 .env
 .run.log
 .run.pid

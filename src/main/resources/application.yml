@@ -14,12 +14,6 @@ server:
 spring:
   application:
     name: safety-rag-qa
-  # 关掉 Spring AI 的 Chroma 自动配置，改用 config/VectorStoreConfig 自行装配：
-  # Spring AI 1.0.0 靠"精确匹配错误文案"判断集合是否存在，而真实 Chroma 返回的文案
-  # 对不上，导致空的向量库永远启动失败（Collection xxx does not exist.）。
-  autoconfigure:
-    exclude:
-      - org.springframework.ai.vectorstore.chroma.autoconfigure.ChromaVectorStoreAutoConfiguration
   servlet:
     multipart:
       # 单个文件上限；max-request-size 是整批（批量上传一次可能带十几个文件）
@@ -63,27 +57,25 @@ spring:
           # 通义 text-embedding-v3（1024 维）；也可替换为服务端提供的
           # bge-large-zh-v1.5 等兼容端点模型名
           model: ${LLM_EMBEDDING_MODEL:text-embedding-v3}
-    # ---------- 向量库：Chroma（唯一实现） ----------
-    # 装配代码见 config/VectorStoreConfig.java：自己建 tenant/database/collection，
-    # 不依赖 Spring AI 的自动配置（它靠精确匹配错误文案判断集合是否存在，实测永远失败）。
+    # ---------- 向量库：Qdrant ----------
+    # 装配代码见 config/VectorStoreConfig.java：显式建集合（指定维度与距离度量）
+    # 并给 docId / chunkIndex 建 payload 索引，不依赖自动建表。
     #
-    # 前置条件（二选一，都要能访问下面的 host:port）：
-    #   1) 本机 Docker：      docker compose up -d
-    #   2) 远程/虚拟机 Docker：把 CHROMA_HOST 指过去即可（Chroma 本身不需要外网）
-    # 换地址只改环境变量，别改这里：
-    #   CHROMA_HOST=http://192.168.1.20 bash restart.sh
-    # Windows 本机 pip 版（chromadb + chroma-hnswlib）在写入时必段错误，见 README 实测记录。
+    # 前置条件：Qdrant 容器在跑，且两个端口都可达——
+    #   6333 = HTTP / REST / dashboard，6334 = gRPC（Spring AI 客户端走这个）
+    # 只映射 6333 的典型症状是 dashboard 能打开、应用却连不上。
+    #
+    # 换地址只改环境变量：
+    #   QDRANT_HOST=127.0.0.1 bash restart.sh
     vectorstore:
-      chroma:
-        client:
-          host: ${CHROMA_HOST:http://localhost}
-          port: ${CHROMA_PORT:8000}
-        # Spring AI 用固定名字的 tenant/database，一般不用改
-        tenant-name: ${CHROMA_TENANT:SpringAiTenant}
-        database-name: ${CHROMA_DATABASE:SpringAiDatabase}
-        collection-name: ${CHROMA_COLLECTION:safety-regulations}
-        # 由 VectorStoreConfig 负责建集合，这里保留语义上的开关
-        initialize-schema: true
+      qdrant:
+        host: ${QDRANT_HOST:localhost}
+        # 注意这是 gRPC 端口，不是 6333
+        port: ${QDRANT_GRPC_PORT:6334}
+        collection-name: ${QDRANT_COLLECTION:safety-regulations}
+        use-tls: false
+        # 集合与 payload 索引由 VectorStoreConfig 负责创建，这里保持关闭
+        initialize-schema: false
 
 # ---------- 本项目自定义配置（对应 config/AppProperties） ----------
 app:
@@ -94,6 +86,10 @@ app:
   demo-mode: ${APP_DEMO_MODE:false}
   # 原始文档与注册表的存放目录（相对路径以项目根目录为准）
   data-dir: ${APP_DATA_DIR:./data}
+  # 向量维度：Qdrant 必须在建集合时就把维度定死（Chroma 是插入时才确定）。
+  # 换 embedding 模型必须同步改这个值并重建集合，否则写入会报维度不匹配。
+  #   text-embedding-v3 → 1024，bge-large-zh-v1.5 → 1024，text-embedding-3-small → 1536
+  vector-dimension: ${EMBEDDING_DIMENSION:1024}
   chunking:
     # 单块最大字符数（条款切分时整条超过该值才启用窗口兜底切分）
     chunk-size: 500

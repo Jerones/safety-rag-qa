@@ -6,7 +6,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * 本项目自定义配置（对应 application.yml 中的 app.* 节点）。
  *
  * @param demoMode  演示模式：true 时使用本地兜底 Embedding + 抽取式回答，不调外部 API
- * @param dataDir   数据目录（原始文档、注册表 JSON；向量不在本地，存 Chroma）
+ * @param dataDir   数据目录（原始文档、注册表 JSON；向量不在本地，存 Qdrant）
+ * @param vectorDimension 向量维度：Qdrant 必须在建集合时定死，换 embedding 模型要同步改
  * @param chunking  切分参数
  * @param retrieval 检索参数
  */
@@ -14,9 +15,21 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record AppProperties(
         boolean demoMode,
         String dataDir,
+        int vectorDimension,
         Chunking chunking,
         Retrieval retrieval
 ) {
+
+    /**
+     * 向量维度兜底。
+     *
+     * <p>Qdrant 与 Chroma 的一个关键差别：Chroma 的集合是插入时才确定维度，
+     * Qdrant 必须在 {@code createCollection} 时就指定 {@code size}，之后所有
+     * 写入都必须与之一致。所以这个值不是"可选优化"，而是建库契约的一部分。</p>
+     */
+    public int vectorDimensionOrDefault() {
+        return vectorDimension <= 0 ? 1024 : vectorDimension;
+    }
 
     /** 文档切分参数。 */
     public record Chunking(int chunkSize, int overlap) {

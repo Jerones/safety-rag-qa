@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class DocumentRegistryTest {
 
     private static DocumentRegistry registryAt(Path dir) {
-        AppProperties props = new AppProperties(false, dir.toString(), null, null);
+        AppProperties props = new AppProperties(false, dir.toString(), 1024, null, null);
         return new DocumentRegistry(new DocumentRegistry.AppPropertiesHolder(props));
     }
 

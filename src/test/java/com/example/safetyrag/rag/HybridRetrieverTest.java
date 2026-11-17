@@ -149,7 +149,7 @@ class HybridRetrieverTest {
      */
     private HybridRetriever retriever(boolean demoMode, boolean hybridOff, double minScore,
                                       Double minBm25, Boolean introduceNew) {
-        AppProperties properties = new AppProperties(demoMode, "./target/test-data",
+        AppProperties properties = new AppProperties(demoMode, "./target/test-data", 1024,
                 new AppProperties.Chunking(500, 60),
                 // 单元测试固定用 weighted 融合 + margin=0：这些用例断言的是
                 // "阈值过滤 / BM25 能否救场"这类行为，不该随融合策略的默认值漂移。

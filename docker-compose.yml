@@ -1,15 +1,24 @@
-# 一键启动 Chroma 向量数据库（本工程唯一的向量库实现）
+# 一键启动 Qdrant 向量数据库（本工程唯一的向量库实现）
 # 用法：在本目录执行  docker compose up -d
-# 然后启动 Spring Boot 应用即可（application.yml 默认连 localhost:8000；
-# Chroma 在别的机器上时用 CHROMA_HOST=http://<ip> 指定）
+# 然后启动 Spring Boot 应用即可。
+#
+# 两个端口缺一不可：
+#   6333 = HTTP / REST / dashboard（浏览器打开 http://<ip>:6333/dashboard）
+#   6334 = gRPC，Spring AI 的 QdrantVectorStore 走这个
+# 只映射 6333 的典型症状是：dashboard 能打开、应用启动却报 UNAVAILABLE。
+#
+# Qdrant 在别的机器上时用 QDRANT_HOST=<ip> 指定（注意是裸 IP，不要带 http://）。
 services:
-  chroma:
-    image: chromadb/chroma:0.5.23
-    container_name: safety-rag-chroma
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    container_name: safety-rag-qdrant
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "6333:6333"
+      - "6334:6334"
     volumes:
-      - ./data/chroma-server:/chroma/chroma
+      - ./data/qdrant-storage:/qdrant/storage
+      - ./data/qdrant-snapshots:/qdrant/snapshots
     environment:
-      - IS_PERSISTENT=TRUE
-      - ANONYMIZED_TELEMETRY=FALSE
+      # 关掉匿名统计；生产环境若对外开放，记得同时配 QDRANT__SERVICE__API_KEY
+      - QDRANT__TELEMETRY_DISABLED=true
